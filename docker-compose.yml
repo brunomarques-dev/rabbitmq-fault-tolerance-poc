@@ -1,0 +1,84 @@
+services:
+  estornos-gateway-api:
+    image: estornos-gateway-api:latest
+    build:
+      context: .
+      dockerfile: src/Estornos.Gateway.Api/Dockerfile
+    ports:
+      - "5000:8080"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ASPNETCORE_URLS=http://+:8080
+      - PROCESSING_API_URL=http://estornos-processor-api:8080
+      - RABBITMQ_HOST=rabbitmq
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+    depends_on:
+      - estornos-processor-api
+      - rabbitmq
+
+  estornos-processor-api:
+    image: estornos-processor-api:latest
+    build:
+      context: .
+      dockerfile: src/Estornos.Processor.Api/Dockerfile
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ASPNETCORE_URLS=http://+:8080
+      - ConnectionStrings__DefaultConnection=Server=db;Database=EstornosDb;User Id=sa;Password=YourStrong@Pass123;TrustServerCertificate=True;
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+    depends_on:
+      - db
+
+  estornos-consumer-worker:
+    image: estornos-consumer-worker:latest
+    build:
+      context: .
+      dockerfile: src/Estornos.Consumer.Worker/Dockerfile
+    environment:
+      - ConnectionStrings__DefaultConnection=Server=db;Database=EstornosDb;User Id=sa;Password=YourStrong@Pass123;TrustServerCertificate=True;
+      - RABBITMQ_HOST=rabbitmq
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+    depends_on:
+      - db
+      - rabbitmq
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+
+  db:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    ports:
+      - "1435:1433"
+    environment:
+      - ACCEPT_EULA=Y
+      - MSSQL_SA_PASSWORD=YourStrong@Pass123
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 1536M
+    volumes:
+      - mssql-data:/var/opt/mssql
+
+volumes:
+  mssql-data:
