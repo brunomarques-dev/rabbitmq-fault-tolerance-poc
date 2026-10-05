@@ -3,6 +3,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
+using RabbitMQ.Client.Exceptions;
 using System;
 using System.Text;
 using System.Text.Json;
@@ -103,13 +104,35 @@ public class QueueConsumerWorker : BackgroundService
                 }
 
                 // Confirma o recebimento e processamento
-                _channel.BasicAck(deliveryTag: ea.DeliveryTag, multiple: false);
+                try
+                {
+                    if (_channel != null && _channel.IsOpen)
+                    {
+                        _channel.BasicAck(deliveryTag: ea.DeliveryTag, multiple: false);
+                    }
+                }
+                catch (AlreadyClosedException) { }
+                catch (Exception ackEx)
+                {
+                    _logger.LogWarning(ackEx, "[CONSUMER] Falha ao enviar BasicAck (canal/conexão encerrados).");
+                }
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "[CONSUMER] Falha ao gravar no banco. Reenfileirando mensagem no RabbitMQ...");
                 // Se der erro (ex: banco fora), rejeita a mensagem com requeue=true para tentar novamente quando o banco voltar
-                _channel.BasicNack(deliveryTag: ea.DeliveryTag, multiple: false, requeue: true);
+                try
+                {
+                    if (_channel != null && _channel.IsOpen)
+                    {
+                        _channel.BasicNack(deliveryTag: ea.DeliveryTag, multiple: false, requeue: true);
+                    }
+                }
+                catch (AlreadyClosedException) { }
+                catch (Exception nackEx)
+                {
+                    _logger.LogWarning(nackEx, "[CONSUMER] Falha ao enviar BasicNack (canal/conexão encerrados).");
+                }
                 
                 // Pausa breve para evitar loop rápido de erro em caso de banco offline
                 await Task.Delay(2000, stoppingToken);

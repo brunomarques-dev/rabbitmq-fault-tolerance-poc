@@ -6,6 +6,7 @@
 
 ## Test results
 test_results*.md
+results/
 
 ## User-specific files and IDEs
 .vs/

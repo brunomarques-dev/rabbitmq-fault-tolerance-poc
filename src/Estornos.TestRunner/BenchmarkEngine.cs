@@ -13,22 +13,39 @@ namespace Estornos.TestRunner;
 
 public static class BenchmarkEngine
 {
+    private static int _currentSent = 0;
+    private static int _currentAccepted = 0;
+
+    public static (int Sent, int HTTPAccepted) CurrentProgress => (_currentSent, _currentAccepted);
+
     private static readonly HttpClient HttpClientInstance = new(new SocketsHttpHandler
     {
         PooledConnectionLifetime = TimeSpan.FromMinutes(15),
         MaxConnectionsPerServer = 200
     })
     {
-        Timeout = TimeSpan.FromSeconds(60) // Timeout HTTP de 60s explicitamente configurado no cliente da PoC
+        Timeout = TimeSpan.FromSeconds(60) // Timeout HTTP de 60s mantido sem alterações
     };
 
-    public static async Task<TestMetrics> SendConstantRateLoadAsync(string url, int ratePerSecond, TimeSpan duration, CancellationToken token)
+    public static async Task<TestMetrics> SendConstantRateLoadAsync(
+        string url,
+        int ratePerSecond,
+        TimeSpan duration,
+        string scenarioName,
+        string flowName,
+        int runNumber,
+        CancellationToken token)
     {
+        _currentSent = 0;
+        _currentAccepted = 0;
+
         var resultsBag = new ConcurrentBag<RequestResult>();
         int sent = 0;
-        int success = 0;
-        int failure = 0;
+        int httpAccepted = 0;
+        int httpFailed = 0;
 
+
+        DateTime sendStartTimestamp = DateTime.UtcNow;
         var stopwatch = Stopwatch.StartNew();
         var tasks = new List<Task>();
         double intervalMs = 1000.0 / ratePerSecond;
@@ -41,47 +58,64 @@ public static class BenchmarkEngine
 
         while (requestId < totalTargetRequests && !token.IsCancellationRequested)
         {
-            Interlocked.Increment(ref sent);
+            int currentSentVal = Interlocked.Increment(ref sent);
+            Interlocked.Exchange(ref _currentSent, currentSentVal);
             int currentId = requestId++;
 
             tasks.Add(Task.Run(async () =>
             {
+                var reqStartTimestamp = DateTime.UtcNow;
                 var reqStopwatch = Stopwatch.StartNew();
-                double startTimeMs = stopwatch.Elapsed.TotalMilliseconds;
                 bool isSuccess = false;
+                int statusCode = 0;
+                string? exceptionMsg = null;
+                string txId = $"TX-{Guid.NewGuid()}";
 
                 using var reqCts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
-                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(token, reqCts.Token);
 
                 try
                 {
-                    var payload = new RequestEstorno($"TX-{Guid.NewGuid()}", 50.00m, $"Teste Carga {currentId}");
+                    var payload = new RequestEstorno(txId, 50.00m, $"Teste Carga {currentId}");
                     var json = JsonSerializer.Serialize(payload);
                     using var content = new StringContent(json, Encoding.UTF8, "application/json");
 
-                    var response = await HttpClientInstance.PostAsync(url, content, linkedCts.Token);
+                    var response = await HttpClientInstance.PostAsync(url, content, reqCts.Token);
                     reqStopwatch.Stop();
+                    statusCode = (int)response.StatusCode;
                     isSuccess = response.IsSuccessStatusCode;
 
-                    if (isSuccess) Interlocked.Increment(ref success);
-                    else Interlocked.Increment(ref failure);
+                    if (isSuccess)
+                    {
+                        int currentAccVal = Interlocked.Increment(ref httpAccepted);
+                        Interlocked.Exchange(ref _currentAccepted, currentAccVal);
+                    }
+                    else Interlocked.Increment(ref httpFailed);
                 }
-                catch
+                catch (Exception ex)
                 {
                     reqStopwatch.Stop();
-                    Interlocked.Increment(ref failure);
+                    exceptionMsg = ex.Message;
+                    Interlocked.Increment(ref httpFailed);
                 }
                 finally
                 {
+                    var reqEndTimestamp = DateTime.UtcNow;
                     double latency = reqStopwatch.Elapsed.TotalMilliseconds;
                     resultsBag.Add(new RequestResult
                     {
-                        StartTimeMs = startTimeMs,
+                        Scenario = scenarioName,
+                        Flow = flowName,
+                        Run = runNumber,
+                        IdTransacaoOriginal = txId,
+                        StartTimestamp = reqStartTimestamp,
+                        EndTimestamp = reqEndTimestamp,
                         LatencyMs = latency,
-                        IsSuccess = isSuccess
+                        HttpStatusCode = statusCode,
+                        IsSuccess = isSuccess,
+                        ExceptionMessage = exceptionMsg
                     });
                 }
-            }, token));
+            }));
 
             nextSendTicks += (long)(intervalMs * ticksPerMs);
             long sleepTicks = nextSendTicks - stopwatch.ElapsedTicks;
@@ -112,36 +146,75 @@ public static class BenchmarkEngine
         }
 
         stopwatch.Stop();
-        return CalculateMetrics(sent, success, failure, resultsBag.ToList(), stopwatch.Elapsed.TotalSeconds);
+        DateTime sendEndTimestamp = DateTime.UtcNow;
+        double sendDurationMs = stopwatch.Elapsed.TotalMilliseconds;
+
+        return CalculateMetrics(
+            sent,
+            httpAccepted,
+            httpFailed,
+            resultsBag.ToList(),
+            sendStartTimestamp,
+            sendEndTimestamp,
+            sendDurationMs,
+            ratePerSecond);
     }
 
-    private static TestMetrics CalculateMetrics(int sent, int success, int failure, List<RequestResult> results, double totalDurationSec)
+    private static TestMetrics CalculateMetrics(
+        int sent,
+        int httpAccepted,
+        int httpFailed,
+        List<RequestResult> results,
+        DateTime sendStartTimestamp,
+        DateTime sendEndTimestamp,
+        double sendDurationMs,
+        int ratePerSecond)
     {
-        double avg = 0;
-        double p95 = 0;
+        double meanAll = 0, p95All = 0, p99All = 0, maxAll = 0;
+        double? meanSuccess = null, p95Success = null, p99Success = null;
 
-        var latencies = results.Select(r => r.LatencyMs).ToList();
-
-        if (latencies.Count > 0)
+        var allLatencies = results.Select(r => r.LatencyMs).OrderBy(x => x).ToList();
+        if (allLatencies.Count > 0)
         {
-            avg = latencies.Average();
-            var sorted = latencies.OrderBy(x => x).ToList();
-            int idx = (int)Math.Ceiling(sorted.Count * 0.95) - 1;
-            idx = Math.Max(0, idx);
-            p95 = sorted[idx];
+            meanAll = allLatencies.Average();
+            maxAll = allLatencies.Max();
+            p95All = GetPercentile(allLatencies, 0.95);
+            p99All = GetPercentile(allLatencies, 0.99);
         }
 
-        double throughput = totalDurationSec > 0 ? sent / totalDurationSec : 0;
+        var successLatencies = results.Where(r => r.IsSuccess).Select(r => r.LatencyMs).OrderBy(x => x).ToList();
+        if (successLatencies.Count > 0)
+        {
+            meanSuccess = successLatencies.Average();
+            p95Success = GetPercentile(successLatencies, 0.95);
+            p99Success = GetPercentile(successLatencies, 0.99);
+        }
 
         return new TestMetrics
         {
             Sent = sent,
-            Success = success,
-            Failure = failure,
-            AverageLatencyMs = avg,
-            P95LatencyMs = p95,
-            Throughput = throughput,
+            HTTPAccepted = httpAccepted,
+            HTTPFailed = httpFailed,
+            SendStartTimestamp = sendStartTimestamp,
+            SendEndTimestamp = sendEndTimestamp,
+            SendDurationMs = sendDurationMs,
+            ConfiguredRequestsPerSecond = ratePerSecond,
+            HttpLatencyMeanAll = meanAll,
+            HttpP95All = p95All,
+            HttpP99All = p99All,
+            HttpMaxAll = maxAll,
+            HttpLatencyMeanSuccess = meanSuccess,
+            HttpP95Success = p95Success,
+            HttpP99Success = p99Success,
             RequestResults = results
         };
+    }
+
+    public static double GetPercentile(List<double> sortedValues, double percentile)
+    {
+        if (sortedValues == null || sortedValues.Count == 0) return 0;
+        int idx = (int)Math.Ceiling(sortedValues.Count * percentile) - 1;
+        idx = Math.Clamp(idx, 0, sortedValues.Count - 1);
+        return sortedValues[idx];
     }
 }

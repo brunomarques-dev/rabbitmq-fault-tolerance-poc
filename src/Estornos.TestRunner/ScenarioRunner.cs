@@ -11,619 +11,1135 @@ public static class ScenarioRunner
 {
     private static readonly string SincUrl = "http://localhost:5000/api/estornos/sinc";
     private static readonly string AsincUrl = "http://localhost:5000/api/estornos/asinc";
-    private const int NumRuns = 1;
+    public const int NumRuns = 3;
 
-    public static async Task RunScenarioA(string workspacePath, List<ScenarioResult> results)
+    public static async Task<List<ConsolidatedScenarioResult>> RunScenarioA(string workspacePath, int numRuns = NumRuns)
     {
-        Console.WriteLine("\n=== [CENÁRIO A: FALHA DE APLICAÇÃO (10 REQ/S - 2 MIN OUTAGE)] ===");
+        Console.WriteLine("\n=== [CENÁRIO A: FALHA DE APLICAÇÃO (5 REQ/S - 2 MIN OUTAGE WORKER)] ===");
 
         // --- SÍNCRONO ---
-        Console.WriteLine($"\nIniciando Teste Síncrono (Estornos.Processor.Api offline por 2 min) - {NumRuns} execuções...");
-        var runsSinc = new List<ScenarioResult>();
+        Console.WriteLine($"\nIniciando Teste Síncrono (Estornos.Processor.Api offline por 2 min) - {numRuns} execuções...");
+        var runsSinc = new List<SingleRunResult>();
 
-        for (int run = 1; run <= NumRuns; run++)
+        for (int run = 1; run <= numRuns; run++)
         {
-            Console.WriteLine($"\n[Síncrono] Execução {run}/{NumRuns}...");
-            DockerManager.EnsureAllServicesRunning(workspacePath);
-            DatabaseHelper.ClearEstornos();
+            Console.WriteLine($"\n[Síncrono] Execução {run}/{numRuns}...");
+            await DockerManager.PrepareCleanEnvironmentAsync(workspacePath);
 
             using var ctsSinc = new CancellationTokenSource();
-            var stopwatchSinc = Stopwatch.StartNew();
+            var expSw = Stopwatch.StartNew();
 
-            var loadTaskSinc = BenchmarkEngine.SendConstantRateLoadAsync(SincUrl, 10, TimeSpan.FromSeconds(300), ctsSinc.Token);
+            var loadTaskSinc = BenchmarkEngine.SendConstantRateLoadAsync(
+                SincUrl, 5, TimeSpan.FromSeconds(300), "Cenário A: Falha de Aplicação", "Síncrono", run, ctsSinc.Token);
 
             await Task.Delay(TimeSpan.FromSeconds(60));
             DockerManager.RunDockerCommand(workspacePath, "stop", "estornos-processor-api");
 
             await Task.Delay(TimeSpan.FromSeconds(120));
-            long startServiceTimeMs = stopwatchSinc.ElapsedMilliseconds;
+            DateTime restoreTime = DateTime.UtcNow;
             DockerManager.RunDockerCommand(workspacePath, "start", "estornos-processor-api");
 
             await Task.Delay(TimeSpan.FromSeconds(120));
             ctsSinc.Cancel();
 
             var sincMetrics = await loadTaskSinc;
-            stopwatchSinc.Stop();
+            DateTime sendEndTimestamp = DateTime.UtcNow;
+            expSw.Stop();
 
-            double recoveryTimeMs = 0;
+            int persAtEnd = DatabaseHelper.GetEstornosCount();
+            await Task.Delay(3000);
+            var dbMetrics = DatabaseHelper.GetDbMetrics();
+
+            double? httpRecoveryMs = null;
             var firstSuccess = sincMetrics.RequestResults
-                .Where(r => r.IsSuccess && r.StartTimeMs >= startServiceTimeMs)
-                .OrderBy(r => r.StartTimeMs)
-                .Cast<RequestResult?>()
+                .Where(r => r.IsSuccess && r.StartTimestamp >= restoreTime)
+                .OrderBy(r => r.StartTimestamp)
                 .FirstOrDefault();
 
-            if (firstSuccess.HasValue)
+            if (firstSuccess != null)
             {
-                recoveryTimeMs = (firstSuccess.Value.StartTimeMs + firstSuccess.Value.LatencyMs) - startServiceTimeMs;
+                httpRecoveryMs = (firstSuccess.EndTimestamp - restoreTime).TotalMilliseconds;
             }
 
-            await Task.Delay(3000);
-            int sincPersisted = DatabaseHelper.GetEstornosCount();
-
-            runsSinc.Add(new ScenarioResult
+            runsSinc.Add(new SingleRunResult
             {
                 Scenario = "Cenário A: Falha de Aplicação",
                 Flow = "Síncrono",
+                RunNumber = run,
                 Sent = sincMetrics.Sent,
-                Success = sincMetrics.Success,
-                Failure = sincMetrics.Failure,
-                Persisted = sincPersisted,
-                AverageLatencyMs = sincMetrics.AverageLatencyMs,
-                P95LatencyMs = sincMetrics.P95LatencyMs,
-                Throughput = sincMetrics.Throughput,
-                RecoveryTimeMs = recoveryTimeMs,
-                MaxQueueDepth = 0
+                HTTPAccepted = sincMetrics.HTTPAccepted,
+                HTTPFailed = sincMetrics.HTTPFailed,
+
+                // Snapshot no término do envio (AtSendEnd)
+                HTTPAcceptedAtSendEnd = sincMetrics.HTTPAccepted,
+                UniquePersistedAtSendEnd = persAtEnd,
+                QueueReadyAtSendEnd = null,
+                QueueUnackedAtSendEnd = null,
+                QueueTotalAtSendEnd = null,
+
+                // Estado final pós-drenagem (Final)
+                PersistedRowsFinal = dbMetrics.TotalPersisted,
+                UniquePersistedFinal = dbMetrics.UniquePersisted,
+                DuplicateRowsFinal = dbMetrics.DuplicateRows,
+                QueueTotalFinal = null,
+
+                HttpLatencyMeanAll = sincMetrics.HttpLatencyMeanAll,
+                HttpP95All = sincMetrics.HttpP95All,
+                HttpP99All = sincMetrics.HttpP99All,
+                HttpMaxAll = sincMetrics.HttpMaxAll,
+                HttpLatencyMeanSuccess = sincMetrics.HttpLatencyMeanSuccess,
+                HttpP95Success = sincMetrics.HttpP95Success,
+                HttpP99Success = sincMetrics.HttpP99Success,
+                ConfiguredSendRate = 5,
+                ActualSendRate = sincMetrics.ActualSendRate,
+                HttpRecoveryTimeMs = httpRecoveryMs,
+                PersistenceRecoveryTimeMs = httpRecoveryMs,
+                BacklogDrainTimeMs = null,
+                SendDurationMs = sincMetrics.SendDurationMs,
+                TotalExperimentDurationMs = expSw.Elapsed.TotalMilliseconds,
+                DrainCompleted = null,
+                PendingOperations = 0,
+                RawRequestResults = sincMetrics.RequestResults
             });
         }
-        results.Add(ReportGenerator.ConsolidateResults("Cenário A: Falha de Aplicação", "Síncrono", runsSinc));
+        var consolidatedSinc = ReportGenerator.ConsolidateScenario("Cenário A: Falha de Aplicação", "Síncrono", runsSinc);
 
         // --- ASSÍNCRONO ---
-        Console.WriteLine($"\nIniciando Teste Assíncrono (Estornos.Consumer.Worker offline por 2 min) - {NumRuns} execuções...");
-        var runsAsinc = new List<ScenarioResult>();
+        Console.WriteLine($"\nIniciando Teste Assíncrono (Estornos.Consumer.Worker offline por 2 min) - {numRuns} execuções...");
+        var runsAsinc = new List<SingleRunResult>();
 
-        for (int run = 1; run <= NumRuns; run++)
+        for (int run = 1; run <= numRuns; run++)
         {
-            Console.WriteLine($"\n[Assíncrono] Execução {run}/{NumRuns}...");
-            DockerManager.EnsureAllServicesRunning(workspacePath);
-            DatabaseHelper.ClearEstornos();
+            Console.WriteLine($"\n[Assíncrono] Execução {run}/{numRuns}...");
+            await DockerManager.PrepareCleanEnvironmentAsync(workspacePath);
 
+            var queueSamples = new List<QueueMetricSample>();
             using var ctsAsinc = new CancellationTokenSource();
-            var stopwatchAsinc = Stopwatch.StartNew();
+            using var queueCts = RabbitMqManager.StartQueueMonitoring(ctsAsinc.Token, queueSamples, 1000);
+            var expSw = Stopwatch.StartNew();
 
-            var loadTaskAsinc = BenchmarkEngine.SendConstantRateLoadAsync(AsincUrl, 10, TimeSpan.FromSeconds(300), ctsAsinc.Token);
+            var loadTaskAsinc = BenchmarkEngine.SendConstantRateLoadAsync(
+                AsincUrl, 5, TimeSpan.FromSeconds(300), "Cenário A: Falha de Aplicação", "Assíncrono", run, ctsAsinc.Token);
 
             await Task.Delay(TimeSpan.FromSeconds(60));
-            long stopWorkerTimeMs = stopwatchAsinc.ElapsedMilliseconds;
             DockerManager.RunDockerCommand(workspacePath, "stop", "estornos-consumer-worker");
 
             await Task.Delay(TimeSpan.FromSeconds(120));
-            long startWorkerTimeMs = stopwatchAsinc.ElapsedMilliseconds;
+            DateTime restoreTime = DateTime.UtcNow;
+            int dbCountBeforeRestore = DatabaseHelper.GetEstornosCount();
             DockerManager.RunDockerCommand(workspacePath, "start", "estornos-consumer-worker");
 
-            double workerRecoveryMs = 0;
+            double? persistenceRecoveryMs = null;
             var recSw = Stopwatch.StartNew();
-            int initialCount = DatabaseHelper.GetEstornosCount();
             while (recSw.Elapsed.TotalSeconds < 30)
             {
-                if (DatabaseHelper.GetEstornosCount() > initialCount)
+                if (DatabaseHelper.GetEstornosCount() > dbCountBeforeRestore)
                 {
-                    workerRecoveryMs = recSw.Elapsed.TotalMilliseconds;
+                    persistenceRecoveryMs = recSw.Elapsed.TotalMilliseconds;
                     break;
                 }
-                await Task.Delay(50);
+                await Task.Delay(500);
             }
-
-            Console.WriteLine("Aguardando fila esvaziar (sincronização no banco)...");
 
             await Task.Delay(TimeSpan.FromSeconds(120));
             ctsAsinc.Cancel();
 
             var asincMetrics = await loadTaskAsinc;
-            stopwatchAsinc.Stop();
+            DateTime sendEndTimestamp = DateTime.UtcNow;
 
-            await WaitForQueueToDrainAsync(asincMetrics.Success);
+            // Snapshot no término exato do envio (AtSendEnd)
+            int accAtEnd = asincMetrics.HTTPAccepted;
+            int persAtEnd = DatabaseHelper.GetEstornosCount();
+            var (readyAtEnd, unackedAtEnd, totalAtEnd) = await RabbitMqManager.GetQueueStatusAsync();
 
-            int maxBacklog = asincMetrics.RequestResults
-                .Count(r => r.IsSuccess && r.StartTimeMs >= stopWorkerTimeMs && r.StartTimeMs <= startWorkerTimeMs);
+            // Fase de Drenagem pós-envio
+            var (drainCompleted, backlogDrainMs, pendingOps, dbMetrics) = await ExecuteDrainPhaseAsync(
+                asincMetrics.HTTPAccepted, sendEndTimestamp, 600);
+            var (finalReady, finalUnacked, finalTotal) = await RabbitMqManager.GetQueueStatusAsync();
 
-            runsAsinc.Add(new ScenarioResult
+            expSw.Stop();
+            queueCts.Cancel();
+
+            int maxDepth = queueSamples.Count > 0 ? queueSamples.Max(s => s.MessagesTotal) : totalAtEnd;
+            int maxReady = queueSamples.Count > 0 ? queueSamples.Max(s => s.MessagesReady) : readyAtEnd;
+            int maxUnacked = queueSamples.Count > 0 ? queueSamples.Max(s => s.MessagesUnacknowledged) : unackedAtEnd;
+
+            runsAsinc.Add(new SingleRunResult
             {
                 Scenario = "Cenário A: Falha de Aplicação",
                 Flow = "Assíncrono",
+                RunNumber = run,
                 Sent = asincMetrics.Sent,
-                Success = asincMetrics.Success,
-                Failure = asincMetrics.Failure,
-                Persisted = DatabaseHelper.GetEstornosCount(),
-                AverageLatencyMs = asincMetrics.AverageLatencyMs,
-                P95LatencyMs = asincMetrics.P95LatencyMs,
-                Throughput = asincMetrics.Throughput,
-                RecoveryTimeMs = workerRecoveryMs,
-                MaxQueueDepth = maxBacklog
+                HTTPAccepted = asincMetrics.HTTPAccepted,
+                HTTPFailed = asincMetrics.HTTPFailed,
+
+                // Snapshot no término exato do envio (AtSendEnd)
+                HTTPAcceptedAtSendEnd = accAtEnd,
+                UniquePersistedAtSendEnd = persAtEnd,
+                QueueReadyAtSendEnd = readyAtEnd,
+                QueueUnackedAtSendEnd = unackedAtEnd,
+                QueueTotalAtSendEnd = totalAtEnd,
+
+                // Estado final pós-drenagem (Final)
+                PersistedRowsFinal = dbMetrics.TotalPersisted,
+                UniquePersistedFinal = dbMetrics.UniquePersisted,
+                DuplicateRowsFinal = dbMetrics.DuplicateRows,
+                QueueTotalFinal = finalTotal,
+
+                HttpLatencyMeanAll = asincMetrics.HttpLatencyMeanAll,
+                HttpP95All = asincMetrics.HttpP95All,
+                HttpP99All = asincMetrics.HttpP99All,
+                HttpMaxAll = asincMetrics.HttpMaxAll,
+                HttpLatencyMeanSuccess = asincMetrics.HttpLatencyMeanSuccess,
+                HttpP95Success = asincMetrics.HttpP95Success,
+                HttpP99Success = asincMetrics.HttpP99Success,
+                ConfiguredSendRate = 5,
+                ActualSendRate = asincMetrics.ActualSendRate,
+                MaxQueueDepth = maxDepth,
+                MaxMessagesReady = maxReady,
+                MaxMessagesUnacked = maxUnacked,
+                HttpRecoveryTimeMs = null,
+                PersistenceRecoveryTimeMs = persistenceRecoveryMs,
+                BacklogDrainTimeMs = backlogDrainMs,
+                SendDurationMs = asincMetrics.SendDurationMs,
+                TotalExperimentDurationMs = expSw.Elapsed.TotalMilliseconds,
+                DrainCompleted = drainCompleted,
+                PendingOperations = pendingOps,
+                RawRequestResults = asincMetrics.RequestResults,
+                QueueSamples = queueSamples
             });
         }
-        results.Add(ReportGenerator.ConsolidateResults("Cenário A: Falha de Aplicação", "Assíncrono", runsAsinc));
+        var consolidatedAsinc = ReportGenerator.ConsolidateScenario("Cenário A: Falha de Aplicação", "Assíncrono", runsAsinc);
+
+        return new List<ConsolidatedScenarioResult> { consolidatedSinc, consolidatedAsinc };
     }
 
-    public static async Task RunScenarioB(string workspacePath, List<ScenarioResult> results)
+    public static async Task<List<ConsolidatedScenarioResult>> RunScenarioB(string workspacePath, int numRuns = NumRuns)
     {
-        Console.WriteLine("\n=== [CENÁRIO B: FALHA DE BANCO DE DADOS (10 REQ/S - 2 MIN OUTAGE)] ===");
+        Console.WriteLine("\n=== [CENÁRIO B: FALHA DE BANCO DE DADOS (5 REQ/S - 2 MIN OUTAGE DB)] ===");
 
         // --- SÍNCRONO ---
-        Console.WriteLine($"\nIniciando Teste Síncrono (SQL Server 'db' offline por 2 min) - {NumRuns} execuções...");
-        var runsSinc = new List<ScenarioResult>();
+        Console.WriteLine($"\nIniciando Teste Síncrono (SQL Server 'db' offline por 2 min) - {numRuns} execuções...");
+        var runsSinc = new List<SingleRunResult>();
 
-        for (int run = 1; run <= NumRuns; run++)
+        for (int run = 1; run <= numRuns; run++)
         {
-            Console.WriteLine($"\n[Síncrono] Execução {run}/{NumRuns}...");
-            DockerManager.EnsureAllServicesRunning(workspacePath);
-            DatabaseHelper.ClearEstornos();
+            Console.WriteLine($"\n[Síncrono] Execução {run}/{numRuns}...");
+            await DockerManager.PrepareCleanEnvironmentAsync(workspacePath);
 
             using var ctsSinc = new CancellationTokenSource();
-            var stopwatchSinc = Stopwatch.StartNew();
+            var expSw = Stopwatch.StartNew();
 
-            var loadTaskSinc = BenchmarkEngine.SendConstantRateLoadAsync(SincUrl, 10, TimeSpan.FromSeconds(300), ctsSinc.Token);
+            var loadTaskSinc = BenchmarkEngine.SendConstantRateLoadAsync(
+                SincUrl, 5, TimeSpan.FromSeconds(300), "Cenário B: Falha de Banco de Dados", "Síncrono", run, ctsSinc.Token);
 
             await Task.Delay(TimeSpan.FromSeconds(60));
             DockerManager.RunDockerCommand(workspacePath, "stop", "db");
 
             await Task.Delay(TimeSpan.FromSeconds(120));
-            long startServiceTimeMs = stopwatchSinc.ElapsedMilliseconds;
+            DateTime restoreTime = DateTime.UtcNow;
             DockerManager.RunDockerCommand(workspacePath, "start", "db");
 
             await Task.Delay(TimeSpan.FromSeconds(120));
             ctsSinc.Cancel();
 
             var sincMetrics = await loadTaskSinc;
-            stopwatchSinc.Stop();
+            expSw.Stop();
 
-            double recoveryTimeMs = 0;
+            int persAtEnd = DatabaseHelper.GetEstornosCount();
+            await Task.Delay(5000);
+            var dbMetrics = DatabaseHelper.GetDbMetrics();
+
+            double? httpRecoveryMs = null;
             var firstSuccess = sincMetrics.RequestResults
-                .Where(r => r.IsSuccess && r.StartTimeMs >= startServiceTimeMs)
-                .OrderBy(r => r.StartTimeMs)
-                .Cast<RequestResult?>()
+                .Where(r => r.IsSuccess && r.StartTimestamp >= restoreTime)
+                .OrderBy(r => r.StartTimestamp)
                 .FirstOrDefault();
 
-            if (firstSuccess.HasValue)
+            if (firstSuccess != null)
             {
-                recoveryTimeMs = (firstSuccess.Value.StartTimeMs + firstSuccess.Value.LatencyMs) - startServiceTimeMs;
+                httpRecoveryMs = (firstSuccess.EndTimestamp - restoreTime).TotalMilliseconds;
             }
 
-            Console.WriteLine("Aguardando banco de dados responder para contar registros...");
-            int sincPersisted = 0;
-            var retrySw = Stopwatch.StartNew();
-            while (retrySw.Elapsed.TotalSeconds < 30)
-            {
-                try
-                {
-                    sincPersisted = DatabaseHelper.GetEstornosCount();
-                    break;
-                }
-                catch
-                {
-                    await Task.Delay(1000);
-                }
-            }
-
-            runsSinc.Add(new ScenarioResult
+            runsSinc.Add(new SingleRunResult
             {
                 Scenario = "Cenário B: Falha de Banco de Dados",
                 Flow = "Síncrono",
+                RunNumber = run,
                 Sent = sincMetrics.Sent,
-                Success = sincMetrics.Success,
-                Failure = sincMetrics.Failure,
-                Persisted = sincPersisted,
-                AverageLatencyMs = sincMetrics.AverageLatencyMs,
-                P95LatencyMs = sincMetrics.P95LatencyMs,
-                Throughput = sincMetrics.Throughput,
-                RecoveryTimeMs = recoveryTimeMs,
-                MaxQueueDepth = 0
+                HTTPAccepted = sincMetrics.HTTPAccepted,
+                HTTPFailed = sincMetrics.HTTPFailed,
+
+                // Snapshot no término do envio (AtSendEnd)
+                HTTPAcceptedAtSendEnd = sincMetrics.HTTPAccepted,
+                UniquePersistedAtSendEnd = persAtEnd,
+                QueueReadyAtSendEnd = null,
+                QueueUnackedAtSendEnd = null,
+                QueueTotalAtSendEnd = null,
+
+                // Estado final pós-drenagem (Final)
+                PersistedRowsFinal = dbMetrics.TotalPersisted,
+                UniquePersistedFinal = dbMetrics.UniquePersisted,
+                DuplicateRowsFinal = dbMetrics.DuplicateRows,
+                QueueTotalFinal = null,
+
+                HttpLatencyMeanAll = sincMetrics.HttpLatencyMeanAll,
+                HttpP95All = sincMetrics.HttpP95All,
+                HttpP99All = sincMetrics.HttpP99All,
+                HttpMaxAll = sincMetrics.HttpMaxAll,
+                HttpLatencyMeanSuccess = sincMetrics.HttpLatencyMeanSuccess,
+                HttpP95Success = sincMetrics.HttpP95Success,
+                HttpP99Success = sincMetrics.HttpP99Success,
+                ConfiguredSendRate = 5,
+                ActualSendRate = sincMetrics.ActualSendRate,
+                HttpRecoveryTimeMs = httpRecoveryMs,
+                PersistenceRecoveryTimeMs = httpRecoveryMs,
+                BacklogDrainTimeMs = null,
+                SendDurationMs = sincMetrics.SendDurationMs,
+                TotalExperimentDurationMs = expSw.Elapsed.TotalMilliseconds,
+                DrainCompleted = null,
+                PendingOperations = 0,
+                RawRequestResults = sincMetrics.RequestResults
             });
         }
-        results.Add(ReportGenerator.ConsolidateResults("Cenário B: Falha de Banco de Dados", "Síncrono", runsSinc));
+        var consolidatedSinc = ReportGenerator.ConsolidateScenario("Cenário B: Falha de Banco de Dados", "Síncrono", runsSinc);
 
         // --- ASSÍNCRONO ---
-        Console.WriteLine($"\nIniciando Teste Assíncrono (SQL Server 'db' offline por 2 min) - {NumRuns} execuções...");
-        var runsAsinc = new List<ScenarioResult>();
+        Console.WriteLine($"\nIniciando Teste Assíncrono (SQL Server 'db' offline por 2 min) - {numRuns} execuções...");
+        var runsAsinc = new List<SingleRunResult>();
 
-        for (int run = 1; run <= NumRuns; run++)
+        for (int run = 1; run <= numRuns; run++)
         {
-            Console.WriteLine($"\n[Assíncrono] Execução {run}/{NumRuns}...");
-            DockerManager.EnsureAllServicesRunning(workspacePath);
-            DatabaseHelper.ClearEstornos();
+            Console.WriteLine($"\n[Assíncrono] Execução {run}/{numRuns}...");
+            await DockerManager.PrepareCleanEnvironmentAsync(workspacePath);
 
+            var queueSamples = new List<QueueMetricSample>();
             using var ctsAsinc = new CancellationTokenSource();
-            var stopwatchAsinc = Stopwatch.StartNew();
+            using var queueCts = RabbitMqManager.StartQueueMonitoring(ctsAsinc.Token, queueSamples, 1000);
+            var expSw = Stopwatch.StartNew();
 
-            var loadTaskAsinc = BenchmarkEngine.SendConstantRateLoadAsync(AsincUrl, 10, TimeSpan.FromSeconds(300), ctsAsinc.Token);
+            var loadTaskAsinc = BenchmarkEngine.SendConstantRateLoadAsync(
+                AsincUrl, 5, TimeSpan.FromSeconds(300), "Cenário B: Falha de Banco de Dados", "Assíncrono", run, ctsAsinc.Token);
 
             await Task.Delay(TimeSpan.FromSeconds(60));
-            long stopWorkerTimeMs = stopwatchAsinc.ElapsedMilliseconds;
             DockerManager.RunDockerCommand(workspacePath, "stop", "db");
 
             await Task.Delay(TimeSpan.FromSeconds(120));
-            long startWorkerTimeMs = stopwatchAsinc.ElapsedMilliseconds;
+            DateTime restoreTime = DateTime.UtcNow;
             DockerManager.RunDockerCommand(workspacePath, "start", "db");
 
-            double dbRecoveryMs = 0;
+            double? persistenceRecoveryMs = null;
             var recSw = Stopwatch.StartNew();
-            int initialDbCount = 0;
-            try { initialDbCount = DatabaseHelper.GetEstornosCount(); } catch { }
-
             while (recSw.Elapsed.TotalSeconds < 30)
             {
-                try
+                if (DatabaseHelper.GetEstornosCount() > 0)
                 {
-                    int current = DatabaseHelper.GetEstornosCount();
-                    if (current > initialDbCount)
-                    {
-                        dbRecoveryMs = recSw.Elapsed.TotalMilliseconds;
-                        break;
-                    }
+                    persistenceRecoveryMs = recSw.Elapsed.TotalMilliseconds;
+                    break;
                 }
-                catch
-                {
-                    // Aguarda banco terminar de subir
-                }
-                await Task.Delay(100);
+                await Task.Delay(500);
             }
-
-            Console.WriteLine("Aguardando banco responder e fila esvaziar (sincronização)...");
 
             await Task.Delay(TimeSpan.FromSeconds(120));
             ctsAsinc.Cancel();
 
             var asincMetrics = await loadTaskAsinc;
-            stopwatchAsinc.Stop();
+            DateTime sendEndTimestamp = DateTime.UtcNow;
 
-            await WaitForQueueToDrainAsync(asincMetrics.Success);
-            int asincPersisted = DatabaseHelper.GetEstornosCount();
+            // Snapshot no término exato do envio (AtSendEnd)
+            int accAtEnd = asincMetrics.HTTPAccepted;
+            int persAtEnd = DatabaseHelper.GetEstornosCount();
+            var (readyAtEnd, unackedAtEnd, totalAtEnd) = await RabbitMqManager.GetQueueStatusAsync();
 
-            int maxBacklog = asincMetrics.RequestResults
-                .Count(r => r.IsSuccess && r.StartTimeMs >= stopWorkerTimeMs && r.StartTimeMs <= startWorkerTimeMs);
+            // Fase de Drenagem pós-envio
+            var (drainCompleted, backlogDrainMs, pendingOps, dbMetrics) = await ExecuteDrainPhaseAsync(
+                asincMetrics.HTTPAccepted, sendEndTimestamp, 600);
+            var (finalReady, finalUnacked, finalTotal) = await RabbitMqManager.GetQueueStatusAsync();
 
-            runsAsinc.Add(new ScenarioResult
+            expSw.Stop();
+            queueCts.Cancel();
+
+            int maxDepth = queueSamples.Count > 0 ? queueSamples.Max(s => s.MessagesTotal) : totalAtEnd;
+            int maxReady = queueSamples.Count > 0 ? queueSamples.Max(s => s.MessagesReady) : readyAtEnd;
+            int maxUnacked = queueSamples.Count > 0 ? queueSamples.Max(s => s.MessagesUnacknowledged) : unackedAtEnd;
+
+            runsAsinc.Add(new SingleRunResult
             {
                 Scenario = "Cenário B: Falha de Banco de Dados",
                 Flow = "Assíncrono",
+                RunNumber = run,
                 Sent = asincMetrics.Sent,
-                Success = asincMetrics.Success,
-                Failure = asincMetrics.Failure,
-                Persisted = asincPersisted,
-                AverageLatencyMs = asincMetrics.AverageLatencyMs,
-                P95LatencyMs = asincMetrics.P95LatencyMs,
-                Throughput = asincMetrics.Throughput,
-                RecoveryTimeMs = dbRecoveryMs,
-                MaxQueueDepth = maxBacklog
+                HTTPAccepted = asincMetrics.HTTPAccepted,
+                HTTPFailed = asincMetrics.HTTPFailed,
+
+                // Snapshot no término exato do envio (AtSendEnd)
+                HTTPAcceptedAtSendEnd = accAtEnd,
+                UniquePersistedAtSendEnd = persAtEnd,
+                QueueReadyAtSendEnd = readyAtEnd,
+                QueueUnackedAtSendEnd = unackedAtEnd,
+                QueueTotalAtSendEnd = totalAtEnd,
+
+                // Estado final pós-drenagem (Final)
+                PersistedRowsFinal = dbMetrics.TotalPersisted,
+                UniquePersistedFinal = dbMetrics.UniquePersisted,
+                DuplicateRowsFinal = dbMetrics.DuplicateRows,
+                QueueTotalFinal = finalTotal,
+
+                HttpLatencyMeanAll = asincMetrics.HttpLatencyMeanAll,
+                HttpP95All = asincMetrics.HttpP95All,
+                HttpP99All = asincMetrics.HttpP99All,
+                HttpMaxAll = asincMetrics.HttpMaxAll,
+                HttpLatencyMeanSuccess = asincMetrics.HttpLatencyMeanSuccess,
+                HttpP95Success = asincMetrics.HttpP95Success,
+                HttpP99Success = asincMetrics.HttpP99Success,
+                ConfiguredSendRate = 5,
+                ActualSendRate = asincMetrics.ActualSendRate,
+                MaxQueueDepth = maxDepth,
+                MaxMessagesReady = maxReady,
+                MaxMessagesUnacked = maxUnacked,
+                HttpRecoveryTimeMs = null,
+                PersistenceRecoveryTimeMs = persistenceRecoveryMs,
+                BacklogDrainTimeMs = backlogDrainMs,
+                SendDurationMs = asincMetrics.SendDurationMs,
+                TotalExperimentDurationMs = expSw.Elapsed.TotalMilliseconds,
+                DrainCompleted = drainCompleted,
+                PendingOperations = pendingOps,
+                RawRequestResults = asincMetrics.RequestResults,
+                QueueSamples = queueSamples
             });
         }
-        results.Add(ReportGenerator.ConsolidateResults("Cenário B: Falha de Banco de Dados", "Assíncrono", runsAsinc));
+        var consolidatedAsinc = ReportGenerator.ConsolidateScenario("Cenário B: Falha de Banco de Dados", "Assíncrono", runsAsinc);
+
+        return new List<ConsolidatedScenarioResult> { consolidatedSinc, consolidatedAsinc };
     }
 
-    public static async Task RunScenarioC(string workspacePath, List<ScenarioResult> results)
+    public static async Task<List<ConsolidatedScenarioResult>> RunScenarioC(string workspacePath, int numRuns = NumRuns)
     {
-        Console.WriteLine("\n=== [CENÁRIO C: OPERAÇÃO NORMAL (10 REQ/S - 5 MINUTOS CONTROLE)] ===");
+        Console.WriteLine("\n=== [CENÁRIO C: OPERAÇÃO NORMAL (5 REQ/S - 5 MINUTOS CONTROLE)] ===");
 
         // --- SÍNCRONO ---
-        Console.WriteLine($"\nIniciando Teste Síncrono (Sem interrupções) - {NumRuns} execuções...");
-        var runsSinc = new List<ScenarioResult>();
+        Console.WriteLine($"\nIniciando Teste Síncrono (Sem interrupções) - {numRuns} execuções...");
+        var runsSinc = new List<SingleRunResult>();
 
-        for (int run = 1; run <= NumRuns; run++)
+        for (int run = 1; run <= numRuns; run++)
         {
-            Console.WriteLine($"\n[Síncrono] Execução {run}/{NumRuns}...");
-            DockerManager.EnsureAllServicesRunning(workspacePath);
-            DatabaseHelper.ClearEstornos();
+            Console.WriteLine($"\n[Síncrono] Execução {run}/{numRuns}...");
+            await DockerManager.PrepareCleanEnvironmentAsync(workspacePath);
 
             using var ctsSinc = new CancellationTokenSource();
-            var stopwatchSinc = Stopwatch.StartNew();
+            var expSw = Stopwatch.StartNew();
 
-            var loadTaskSinc = BenchmarkEngine.SendConstantRateLoadAsync(SincUrl, 10, TimeSpan.FromSeconds(300), ctsSinc.Token);
+            var loadTaskSinc = BenchmarkEngine.SendConstantRateLoadAsync(
+                SincUrl, 5, TimeSpan.FromSeconds(300), "Cenário C: Controle", "Síncrono", run, ctsSinc.Token);
 
             await Task.Delay(TimeSpan.FromSeconds(300));
             ctsSinc.Cancel();
 
             var sincMetrics = await loadTaskSinc;
-            stopwatchSinc.Stop();
+            expSw.Stop();
 
+            int persAtEnd = DatabaseHelper.GetEstornosCount();
             await Task.Delay(3000);
-            int sincPersisted = DatabaseHelper.GetEstornosCount();
+            var dbMetrics = DatabaseHelper.GetDbMetrics();
 
-            runsSinc.Add(new ScenarioResult
+            runsSinc.Add(new SingleRunResult
             {
                 Scenario = "Cenário C: Controle",
                 Flow = "Síncrono",
+                RunNumber = run,
                 Sent = sincMetrics.Sent,
-                Success = sincMetrics.Success,
-                Failure = sincMetrics.Failure,
-                Persisted = sincPersisted,
-                AverageLatencyMs = sincMetrics.AverageLatencyMs,
-                P95LatencyMs = sincMetrics.P95LatencyMs,
-                Throughput = sincMetrics.Throughput,
-                RecoveryTimeMs = 0,
-                MaxQueueDepth = 0
+                HTTPAccepted = sincMetrics.HTTPAccepted,
+                HTTPFailed = sincMetrics.HTTPFailed,
+
+                // Snapshot no término do envio (AtSendEnd)
+                HTTPAcceptedAtSendEnd = sincMetrics.HTTPAccepted,
+                UniquePersistedAtSendEnd = persAtEnd,
+                QueueReadyAtSendEnd = null,
+                QueueUnackedAtSendEnd = null,
+                QueueTotalAtSendEnd = null,
+
+                // Estado final pós-drenagem (Final)
+                PersistedRowsFinal = dbMetrics.TotalPersisted,
+                UniquePersistedFinal = dbMetrics.UniquePersisted,
+                DuplicateRowsFinal = dbMetrics.DuplicateRows,
+                QueueTotalFinal = null,
+
+                HttpLatencyMeanAll = sincMetrics.HttpLatencyMeanAll,
+                HttpP95All = sincMetrics.HttpP95All,
+                HttpP99All = sincMetrics.HttpP99All,
+                HttpMaxAll = sincMetrics.HttpMaxAll,
+                HttpLatencyMeanSuccess = sincMetrics.HttpLatencyMeanSuccess,
+                HttpP95Success = sincMetrics.HttpP95Success,
+                HttpP99Success = sincMetrics.HttpP99Success,
+                ConfiguredSendRate = 5,
+                ActualSendRate = sincMetrics.ActualSendRate,
+                HttpRecoveryTimeMs = null,
+                PersistenceRecoveryTimeMs = null,
+                BacklogDrainTimeMs = null,
+                SendDurationMs = sincMetrics.SendDurationMs,
+                TotalExperimentDurationMs = expSw.Elapsed.TotalMilliseconds,
+                DrainCompleted = null,
+                PendingOperations = 0,
+                RawRequestResults = sincMetrics.RequestResults
             });
         }
-        results.Add(ReportGenerator.ConsolidateResults("Cenário C: Controle", "Síncrono", runsSinc));
+        var consolidatedSinc = ReportGenerator.ConsolidateScenario("Cenário C: Controle", "Síncrono", runsSinc);
 
         // --- ASSÍNCRONO ---
-        Console.WriteLine($"\nIniciando Teste Assíncrono (Sem interrupções) - {NumRuns} execuções...");
-        var runsAsinc = new List<ScenarioResult>();
+        Console.WriteLine($"\nIniciando Teste Assíncrono (Sem interrupções) - {numRuns} execuções...");
+        var runsAsinc = new List<SingleRunResult>();
 
-        for (int run = 1; run <= NumRuns; run++)
+        for (int run = 1; run <= numRuns; run++)
         {
-            Console.WriteLine($"\n[Assíncrono] Execução {run}/{NumRuns}...");
-            DockerManager.EnsureAllServicesRunning(workspacePath);
-            DatabaseHelper.ClearEstornos();
+            Console.WriteLine($"\n[Assíncrono] Execução {run}/{numRuns}...");
+            await DockerManager.PrepareCleanEnvironmentAsync(workspacePath);
 
+            var queueSamples = new List<QueueMetricSample>();
             using var ctsAsinc = new CancellationTokenSource();
-            var stopwatchAsinc = Stopwatch.StartNew();
+            using var queueCts = RabbitMqManager.StartQueueMonitoring(ctsAsinc.Token, queueSamples, 1000);
+            var expSw = Stopwatch.StartNew();
 
-            var loadTaskAsinc = BenchmarkEngine.SendConstantRateLoadAsync(AsincUrl, 10, TimeSpan.FromSeconds(300), ctsAsinc.Token);
+            var loadTaskAsinc = BenchmarkEngine.SendConstantRateLoadAsync(
+                AsincUrl, 5, TimeSpan.FromSeconds(300), "Cenário C: Controle", "Assíncrono", run, ctsAsinc.Token);
 
             await Task.Delay(TimeSpan.FromSeconds(300));
             ctsAsinc.Cancel();
 
             var asincMetrics = await loadTaskAsinc;
-            stopwatchAsinc.Stop();
+            DateTime sendEndTimestamp = DateTime.UtcNow;
 
-            await WaitForQueueToDrainAsync(asincMetrics.Success);
-            int asincPersisted = DatabaseHelper.GetEstornosCount();
+            // Snapshot no término exato do envio (AtSendEnd)
+            int accAtEnd = asincMetrics.HTTPAccepted;
+            int persAtEnd = DatabaseHelper.GetEstornosCount();
+            var (readyAtEnd, unackedAtEnd, totalAtEnd) = await RabbitMqManager.GetQueueStatusAsync();
 
-            runsAsinc.Add(new ScenarioResult
+            // Fase de Drenagem pós-envio
+            var (drainCompleted, backlogDrainMs, pendingOps, dbMetrics) = await ExecuteDrainPhaseAsync(
+                asincMetrics.HTTPAccepted, sendEndTimestamp, 600);
+            var (finalReady, finalUnacked, finalTotal) = await RabbitMqManager.GetQueueStatusAsync();
+
+            expSw.Stop();
+            queueCts.Cancel();
+
+            int maxDepth = queueSamples.Count > 0 ? queueSamples.Max(s => s.MessagesTotal) : totalAtEnd;
+            int maxReady = queueSamples.Count > 0 ? queueSamples.Max(s => s.MessagesReady) : readyAtEnd;
+            int maxUnacked = queueSamples.Count > 0 ? queueSamples.Max(s => s.MessagesUnacknowledged) : unackedAtEnd;
+
+            runsAsinc.Add(new SingleRunResult
             {
                 Scenario = "Cenário C: Controle",
                 Flow = "Assíncrono",
+                RunNumber = run,
                 Sent = asincMetrics.Sent,
-                Success = asincMetrics.Success,
-                Failure = asincMetrics.Failure,
-                Persisted = asincPersisted,
-                AverageLatencyMs = asincMetrics.AverageLatencyMs,
-                P95LatencyMs = asincMetrics.P95LatencyMs,
-                Throughput = asincMetrics.Throughput,
-                RecoveryTimeMs = 0,
-                MaxQueueDepth = 0
+                HTTPAccepted = asincMetrics.HTTPAccepted,
+                HTTPFailed = asincMetrics.HTTPFailed,
+
+                // Snapshot no término exato do envio (AtSendEnd)
+                HTTPAcceptedAtSendEnd = accAtEnd,
+                UniquePersistedAtSendEnd = persAtEnd,
+                QueueReadyAtSendEnd = readyAtEnd,
+                QueueUnackedAtSendEnd = unackedAtEnd,
+                QueueTotalAtSendEnd = totalAtEnd,
+
+                // Estado final pós-drenagem (Final)
+                PersistedRowsFinal = dbMetrics.TotalPersisted,
+                UniquePersistedFinal = dbMetrics.UniquePersisted,
+                DuplicateRowsFinal = dbMetrics.DuplicateRows,
+                QueueTotalFinal = finalTotal,
+
+                HttpLatencyMeanAll = asincMetrics.HttpLatencyMeanAll,
+                HttpP95All = asincMetrics.HttpP95All,
+                HttpP99All = asincMetrics.HttpP99All,
+                HttpMaxAll = asincMetrics.HttpMaxAll,
+                HttpLatencyMeanSuccess = asincMetrics.HttpLatencyMeanSuccess,
+                HttpP95Success = asincMetrics.HttpP95Success,
+                HttpP99Success = asincMetrics.HttpP99Success,
+                ConfiguredSendRate = 5,
+                ActualSendRate = asincMetrics.ActualSendRate,
+                MaxQueueDepth = maxDepth,
+                MaxMessagesReady = maxReady,
+                MaxMessagesUnacked = maxUnacked,
+                HttpRecoveryTimeMs = null,
+                PersistenceRecoveryTimeMs = null,
+                BacklogDrainTimeMs = backlogDrainMs,
+                SendDurationMs = asincMetrics.SendDurationMs,
+                TotalExperimentDurationMs = expSw.Elapsed.TotalMilliseconds,
+                DrainCompleted = drainCompleted,
+                PendingOperations = pendingOps,
+                RawRequestResults = asincMetrics.RequestResults,
+                QueueSamples = queueSamples
             });
         }
-        results.Add(ReportGenerator.ConsolidateResults("Cenário C: Controle", "Assíncrono", runsAsinc));
+        var consolidatedAsinc = ReportGenerator.ConsolidateScenario("Cenário C: Controle", "Assíncrono", runsAsinc);
+
+        return new List<ConsolidatedScenarioResult> { consolidatedSinc, consolidatedAsinc };
     }
 
-    public static async Task RunScenarioD(string workspacePath, List<ScenarioResult> results)
+    public static async Task<List<ConsolidatedScenarioResult>> RunScenarioD(string workspacePath, int numRuns = NumRuns)
     {
-        Console.WriteLine("\n=== [CENÁRIO D: TESTE DE CARGA (150 REQ/S - 5 MINUTOS)] ===");
+        Console.WriteLine("\n=== [CENÁRIO D: TESTE DE CARGA (150 REQ/S - 5 MINUTOS - 45.000 TARGET)] ===");
 
         // --- SÍNCRONO ---
-        Console.WriteLine($"\nIniciando Teste Síncrono (Carga de 150 req/s) - {NumRuns} execuções...");
-        var runsSinc = new List<ScenarioResult>();
+        Console.WriteLine($"\nIniciando Teste Síncrono (Carga de 150 req/s) - {numRuns} execuções...");
+        var runsSinc = new List<SingleRunResult>();
 
-        for (int run = 1; run <= NumRuns; run++)
+        for (int run = 1; run <= numRuns; run++)
         {
-            Console.WriteLine($"\n[Síncrono] Execução {run}/{NumRuns}...");
-            DockerManager.EnsureAllServicesRunning(workspacePath);
-            DatabaseHelper.ClearEstornos();
+            Console.WriteLine($"\n[Síncrono] Execução {run}/{numRuns}...");
+            await DockerManager.PrepareCleanEnvironmentAsync(workspacePath);
 
             using var ctsSinc = new CancellationTokenSource();
-            var stopwatchSinc = Stopwatch.StartNew();
+            var expSw = Stopwatch.StartNew();
 
-            var loadTaskSinc = BenchmarkEngine.SendConstantRateLoadAsync(SincUrl, 150, TimeSpan.FromSeconds(300), ctsSinc.Token);
+            var loadTaskSinc = BenchmarkEngine.SendConstantRateLoadAsync(
+                SincUrl, 150, TimeSpan.FromSeconds(300), "Cenário D: Teste de Carga", "Síncrono", run, ctsSinc.Token);
 
             await Task.Delay(TimeSpan.FromSeconds(300));
             ctsSinc.Cancel();
 
             var sincMetrics = await loadTaskSinc;
-            stopwatchSinc.Stop();
+            expSw.Stop();
 
-            await Task.Delay(3000);
-            int sincPersisted = DatabaseHelper.GetEstornosCount();
+            int persAtEnd = DatabaseHelper.GetEstornosCount();
+            await Task.Delay(5000);
+            var dbMetrics = DatabaseHelper.GetDbMetrics();
 
-            runsSinc.Add(new ScenarioResult
+            runsSinc.Add(new SingleRunResult
             {
                 Scenario = "Cenário D: Teste de Carga",
                 Flow = "Síncrono",
+                RunNumber = run,
                 Sent = sincMetrics.Sent,
-                Success = sincMetrics.Success,
-                Failure = sincMetrics.Failure,
-                Persisted = sincPersisted,
-                AverageLatencyMs = sincMetrics.AverageLatencyMs,
-                P95LatencyMs = sincMetrics.P95LatencyMs,
-                Throughput = sincMetrics.Throughput,
-                RecoveryTimeMs = 0,
-                MaxQueueDepth = 0
+                HTTPAccepted = sincMetrics.HTTPAccepted,
+                HTTPFailed = sincMetrics.HTTPFailed,
+
+                // Snapshot no término do envio (AtSendEnd)
+                HTTPAcceptedAtSendEnd = sincMetrics.HTTPAccepted,
+                UniquePersistedAtSendEnd = persAtEnd,
+                QueueReadyAtSendEnd = null,
+                QueueUnackedAtSendEnd = null,
+                QueueTotalAtSendEnd = null,
+
+                // Estado final pós-drenagem (Final)
+                PersistedRowsFinal = dbMetrics.TotalPersisted,
+                UniquePersistedFinal = dbMetrics.UniquePersisted,
+                DuplicateRowsFinal = dbMetrics.DuplicateRows,
+                QueueTotalFinal = null,
+
+                HttpLatencyMeanAll = sincMetrics.HttpLatencyMeanAll,
+                HttpP95All = sincMetrics.HttpP95All,
+                HttpP99All = sincMetrics.HttpP99All,
+                HttpMaxAll = sincMetrics.HttpMaxAll,
+                HttpLatencyMeanSuccess = sincMetrics.HttpLatencyMeanSuccess,
+                HttpP95Success = sincMetrics.HttpP95Success,
+                HttpP99Success = sincMetrics.HttpP99Success,
+                ConfiguredSendRate = 150,
+                ActualSendRate = sincMetrics.ActualSendRate,
+                HttpRecoveryTimeMs = null,
+                PersistenceRecoveryTimeMs = null,
+                BacklogDrainTimeMs = null,
+                SendDurationMs = sincMetrics.SendDurationMs,
+                TotalExperimentDurationMs = expSw.Elapsed.TotalMilliseconds,
+                DrainCompleted = null,
+                PendingOperations = 0,
+                RawRequestResults = sincMetrics.RequestResults
             });
         }
-        results.Add(ReportGenerator.ConsolidateResults("Cenário D: Teste de Carga", "Síncrono", runsSinc));
+        var consolidatedSinc = ReportGenerator.ConsolidateScenario("Cenário D: Teste de Carga", "Síncrono", runsSinc);
 
         // --- ASSÍNCRONO ---
-        Console.WriteLine($"\nIniciando Teste Assíncrono (Carga de 150 req/s) - {NumRuns} execuções...");
-        var runsAsinc = new List<ScenarioResult>();
+        Console.WriteLine($"\nIniciando Teste Assíncrono (Carga de 150 req/s) - {numRuns} execuções...");
+        var runsAsinc = new List<SingleRunResult>();
 
-        for (int run = 1; run <= NumRuns; run++)
+        for (int run = 1; run <= numRuns; run++)
         {
-            Console.WriteLine($"\n[Assíncrono] Execução {run}/{NumRuns}...");
-            DockerManager.EnsureAllServicesRunning(workspacePath);
-            DatabaseHelper.ClearEstornos();
+            Console.WriteLine($"\n[Assíncrono] Execução {run}/{numRuns}...");
+            await DockerManager.PrepareCleanEnvironmentAsync(workspacePath);
 
+            var queueSamples = new List<QueueMetricSample>();
             using var ctsAsinc = new CancellationTokenSource();
-            var stopwatchAsinc = Stopwatch.StartNew();
+            using var queueCts = RabbitMqManager.StartQueueMonitoring(ctsAsinc.Token, queueSamples, 1000);
+            var expSw = Stopwatch.StartNew();
 
-            var loadTaskAsinc = BenchmarkEngine.SendConstantRateLoadAsync(AsincUrl, 150, TimeSpan.FromSeconds(300), ctsAsinc.Token);
+            var loadTaskAsinc = BenchmarkEngine.SendConstantRateLoadAsync(
+                AsincUrl, 150, TimeSpan.FromSeconds(300), "Cenário D: Teste de Carga", "Assíncrono", run, ctsAsinc.Token);
 
             await Task.Delay(TimeSpan.FromSeconds(300));
             ctsAsinc.Cancel();
 
             var asincMetrics = await loadTaskAsinc;
-            stopwatchAsinc.Stop();
+            DateTime sendEndTimestamp = DateTime.UtcNow;
 
-            var esvaziamentoSw = Stopwatch.StartNew();
-            Console.WriteLine("Aguardando fila esvaziar (sincronização no banco)...");
-            await WaitForQueueToDrainAsync(asincMetrics.Success);
-            esvaziamentoSw.Stop();
-            double queueRecoveryTimeMs = esvaziamentoSw.Elapsed.TotalMilliseconds;
+            // Snapshot no término exato do envio (AtSendEnd)
+            int accAtEnd = asincMetrics.HTTPAccepted;
+            int persAtEnd = DatabaseHelper.GetEstornosCount();
+            var (readyAtEnd, unackedAtEnd, totalAtEnd) = await RabbitMqManager.GetQueueStatusAsync();
 
-            runsAsinc.Add(new ScenarioResult
+            Console.WriteLine("[CENÁRIO D] Envio de 300s encerrado. Iniciando medição do BacklogDrainTime pós-envio (Timeout de Segurança = 600s)...");
+
+            var (drainCompleted, backlogDrainMs, pendingOps, dbMetrics) = await ExecuteDrainPhaseAsync(
+                asincMetrics.HTTPAccepted, sendEndTimestamp, 600);
+            var (finalReady, finalUnacked, finalTotal) = await RabbitMqManager.GetQueueStatusAsync();
+
+            expSw.Stop();
+            queueCts.Cancel();
+
+            int maxDepth = queueSamples.Count > 0 ? queueSamples.Max(s => s.MessagesTotal) : totalAtEnd;
+            int maxReady = queueSamples.Count > 0 ? queueSamples.Max(s => s.MessagesReady) : readyAtEnd;
+            int maxUnacked = queueSamples.Count > 0 ? queueSamples.Max(s => s.MessagesUnacknowledged) : unackedAtEnd;
+
+            runsAsinc.Add(new SingleRunResult
             {
                 Scenario = "Cenário D: Teste de Carga",
                 Flow = "Assíncrono",
+                RunNumber = run,
                 Sent = asincMetrics.Sent,
-                Success = asincMetrics.Success,
-                Failure = asincMetrics.Failure,
-                Persisted = DatabaseHelper.GetEstornosCount(),
-                AverageLatencyMs = asincMetrics.AverageLatencyMs,
-                P95LatencyMs = asincMetrics.P95LatencyMs,
-                Throughput = asincMetrics.Throughput,
-                RecoveryTimeMs = 0,
-                MaxQueueDepth = 0
+                HTTPAccepted = asincMetrics.HTTPAccepted,
+                HTTPFailed = asincMetrics.HTTPFailed,
+
+                // Snapshot no término exato do envio (AtSendEnd)
+                HTTPAcceptedAtSendEnd = accAtEnd,
+                UniquePersistedAtSendEnd = persAtEnd,
+                QueueReadyAtSendEnd = readyAtEnd,
+                QueueUnackedAtSendEnd = unackedAtEnd,
+                QueueTotalAtSendEnd = totalAtEnd,
+
+                // Estado final pós-drenagem (Final)
+                PersistedRowsFinal = dbMetrics.TotalPersisted,
+                UniquePersistedFinal = dbMetrics.UniquePersisted,
+                DuplicateRowsFinal = dbMetrics.DuplicateRows,
+                QueueTotalFinal = finalTotal,
+
+                HttpLatencyMeanAll = asincMetrics.HttpLatencyMeanAll,
+                HttpP95All = asincMetrics.HttpP95All,
+                HttpP99All = asincMetrics.HttpP99All,
+                HttpMaxAll = asincMetrics.HttpMaxAll,
+                HttpLatencyMeanSuccess = asincMetrics.HttpLatencyMeanSuccess,
+                HttpP95Success = asincMetrics.HttpP95Success,
+                HttpP99Success = asincMetrics.HttpP99Success,
+                ConfiguredSendRate = 150,
+                ActualSendRate = asincMetrics.ActualSendRate,
+                MaxQueueDepth = maxDepth,
+                MaxMessagesReady = maxReady,
+                MaxMessagesUnacked = maxUnacked,
+                HttpRecoveryTimeMs = null,
+                PersistenceRecoveryTimeMs = null,
+                BacklogDrainTimeMs = backlogDrainMs,
+                SendDurationMs = asincMetrics.SendDurationMs,
+                TotalExperimentDurationMs = expSw.Elapsed.TotalMilliseconds,
+                DrainCompleted = drainCompleted,
+                PendingOperations = pendingOps,
+                RawRequestResults = asincMetrics.RequestResults,
+                QueueSamples = queueSamples
             });
         }
-        results.Add(ReportGenerator.ConsolidateResults("Cenário D: Teste de Carga", "Assíncrono", runsAsinc));
+        var consolidatedAsinc = ReportGenerator.ConsolidateScenario("Cenário D: Teste de Carga", "Assíncrono", runsAsinc);
+
+        return new List<ConsolidatedScenarioResult> { consolidatedSinc, consolidatedAsinc };
     }
 
-    public static async Task RunScenarioE(string workspacePath, List<ScenarioResult> results)
+    public static async Task<List<ConsolidatedScenarioResult>> RunScenarioE(string workspacePath, int numRuns = NumRuns)
     {
-        Console.WriteLine("\n=== [CENÁRIO E: FALHA DE MENSAGERIA (10 REQ/S - 2 MIN OUTAGE RABBITMQ)] ===");
+        Console.WriteLine("\n=== [CENÁRIO E: FALHA DE MENSAGERIA (5 REQ/S - 2 MIN OUTAGE RABBITMQ)] ===");
 
         // --- SÍNCRONO ---
-        Console.WriteLine($"\nIniciando Teste Síncrono (RabbitMQ 'rabbitmq' offline por 2 min) - {NumRuns} execuções...");
-        var runsSinc = new List<ScenarioResult>();
+        Console.WriteLine($"\nIniciando Teste Síncrono (RabbitMQ 'rabbitmq' offline por 2 min) - {numRuns} execuções...");
+        var runsSinc = new List<SingleRunResult>();
 
-        for (int run = 1; run <= NumRuns; run++)
+        for (int run = 1; run <= numRuns; run++)
         {
-            Console.WriteLine($"\n[Síncrono] Execução {run}/{NumRuns}...");
-            DockerManager.EnsureAllServicesRunning(workspacePath);
-            DatabaseHelper.ClearEstornos();
+            Console.WriteLine($"\n[Síncrono] Execução {run}/{numRuns}...");
+            await DockerManager.PrepareCleanEnvironmentAsync(workspacePath);
 
             using var ctsSinc = new CancellationTokenSource();
-            var stopwatchSinc = Stopwatch.StartNew();
+            var expSw = Stopwatch.StartNew();
 
-            var loadTaskSinc = BenchmarkEngine.SendConstantRateLoadAsync(SincUrl, 10, TimeSpan.FromSeconds(300), ctsSinc.Token);
+            var loadTaskSinc = BenchmarkEngine.SendConstantRateLoadAsync(
+                SincUrl, 5, TimeSpan.FromSeconds(300), "Cenário E: Falha de Mensageria", "Síncrono", run, ctsSinc.Token);
 
             await Task.Delay(TimeSpan.FromSeconds(60));
             DockerManager.RunDockerCommand(workspacePath, "stop", "rabbitmq");
 
             await Task.Delay(TimeSpan.FromSeconds(120));
-            long startServiceTimeMs = stopwatchSinc.ElapsedMilliseconds;
             DockerManager.RunDockerCommand(workspacePath, "start", "rabbitmq");
 
             await Task.Delay(TimeSpan.FromSeconds(120));
             ctsSinc.Cancel();
 
             var sincMetrics = await loadTaskSinc;
-            stopwatchSinc.Stop();
+            expSw.Stop();
 
+            int persAtEnd = DatabaseHelper.GetEstornosCount();
             await Task.Delay(3000);
-            int sincPersisted = DatabaseHelper.GetEstornosCount();
+            var dbMetrics = DatabaseHelper.GetDbMetrics();
 
-            runsSinc.Add(new ScenarioResult
+            runsSinc.Add(new SingleRunResult
             {
                 Scenario = "Cenário E: Falha de Mensageria",
                 Flow = "Síncrono",
+                RunNumber = run,
                 Sent = sincMetrics.Sent,
-                Success = sincMetrics.Success,
-                Failure = sincMetrics.Failure,
-                Persisted = sincPersisted,
-                AverageLatencyMs = sincMetrics.AverageLatencyMs,
-                P95LatencyMs = sincMetrics.P95LatencyMs,
-                Throughput = sincMetrics.Throughput,
-                RecoveryTimeMs = 0,
-                MaxQueueDepth = 0
+                HTTPAccepted = sincMetrics.HTTPAccepted,
+                HTTPFailed = sincMetrics.HTTPFailed,
+
+                // Snapshot no término do envio (AtSendEnd)
+                HTTPAcceptedAtSendEnd = sincMetrics.HTTPAccepted,
+                UniquePersistedAtSendEnd = persAtEnd,
+                QueueReadyAtSendEnd = null,
+                QueueUnackedAtSendEnd = null,
+                QueueTotalAtSendEnd = null,
+
+                // Estado final pós-drenagem (Final)
+                PersistedRowsFinal = dbMetrics.TotalPersisted,
+                UniquePersistedFinal = dbMetrics.UniquePersisted,
+                DuplicateRowsFinal = dbMetrics.DuplicateRows,
+                QueueTotalFinal = null,
+
+                HttpLatencyMeanAll = sincMetrics.HttpLatencyMeanAll,
+                HttpP95All = sincMetrics.HttpP95All,
+                HttpP99All = sincMetrics.HttpP99All,
+                HttpMaxAll = sincMetrics.HttpMaxAll,
+                HttpLatencyMeanSuccess = sincMetrics.HttpLatencyMeanSuccess,
+                HttpP95Success = sincMetrics.HttpP95Success,
+                HttpP99Success = sincMetrics.HttpP99Success,
+                ConfiguredSendRate = 5,
+                ActualSendRate = sincMetrics.ActualSendRate,
+                HttpRecoveryTimeMs = null,
+                PersistenceRecoveryTimeMs = null,
+                BacklogDrainTimeMs = null,
+                SendDurationMs = sincMetrics.SendDurationMs,
+                TotalExperimentDurationMs = expSw.Elapsed.TotalMilliseconds,
+                DrainCompleted = null,
+                PendingOperations = 0,
+                RawRequestResults = sincMetrics.RequestResults
             });
         }
-        results.Add(ReportGenerator.ConsolidateResults("Cenário E: Falha de Mensageria", "Síncrono", runsSinc));
+        var consolidatedSinc = ReportGenerator.ConsolidateScenario("Cenário E: Falha de Mensageria", "Síncrono", runsSinc);
 
         // --- ASSÍNCRONO ---
-        Console.WriteLine($"\nIniciando Teste Assíncrono (RabbitMQ 'rabbitmq' offline por 2 min) - {NumRuns} execuções...");
-        var runsAsinc = new List<ScenarioResult>();
+        Console.WriteLine($"\nIniciando Teste Assíncrono (RabbitMQ 'rabbitmq' offline por 2 min) - {numRuns} execuções...");
+        var runsAsinc = new List<SingleRunResult>();
 
-        for (int run = 1; run <= NumRuns; run++)
+        for (int run = 1; run <= numRuns; run++)
         {
-            Console.WriteLine($"\n[Assíncrono] Execução {run}/{NumRuns}...");
-            DockerManager.EnsureAllServicesRunning(workspacePath);
-            DatabaseHelper.ClearEstornos();
+            Console.WriteLine($"\n[Assíncrono] Execução {run}/{numRuns}...");
+            await DockerManager.PrepareCleanEnvironmentAsync(workspacePath);
 
+            var queueSamples = new List<QueueMetricSample>();
             using var ctsAsinc = new CancellationTokenSource();
-            var stopwatchAsinc = Stopwatch.StartNew();
+            using var queueCts = RabbitMqManager.StartQueueMonitoring(ctsAsinc.Token, queueSamples, 1000);
+            var expSw = Stopwatch.StartNew();
 
-            var loadTaskAsinc = BenchmarkEngine.SendConstantRateLoadAsync(AsincUrl, 10, TimeSpan.FromSeconds(300), ctsAsinc.Token);
+            var loadTaskAsinc = BenchmarkEngine.SendConstantRateLoadAsync(
+                AsincUrl, 5, TimeSpan.FromSeconds(300), "Cenário E: Falha de Mensageria", "Assíncrono", run, ctsAsinc.Token);
 
             await Task.Delay(TimeSpan.FromSeconds(60));
-            long stopWorkerTimeMs = stopwatchAsinc.ElapsedMilliseconds;
             DockerManager.RunDockerCommand(workspacePath, "stop", "rabbitmq");
 
             await Task.Delay(TimeSpan.FromSeconds(120));
-            long startWorkerTimeMs = stopwatchAsinc.ElapsedMilliseconds;
+            DateTime restoreTime = DateTime.UtcNow;
             DockerManager.RunDockerCommand(workspacePath, "start", "rabbitmq");
-
-            var esvaziamentoSw = Stopwatch.StartNew();
-            Console.WriteLine("Aguardando RabbitMQ estabilizar e mensagens serem processadas...");
 
             await Task.Delay(TimeSpan.FromSeconds(120));
             ctsAsinc.Cancel();
 
             var asincMetrics = await loadTaskAsinc;
-            stopwatchAsinc.Stop();
+            DateTime sendEndTimestamp = DateTime.UtcNow;
 
-            double recoveryTimeMs = 0;
+            // Snapshot no término exato do envio (AtSendEnd)
+            int accAtEnd = asincMetrics.HTTPAccepted;
+            int persAtEnd = DatabaseHelper.GetEstornosCount();
+            var (readyAtEnd, unackedAtEnd, totalAtEnd) = await RabbitMqManager.GetQueueStatusAsync();
+
+            double? httpRecoveryMs = null;
             var firstSuccess = asincMetrics.RequestResults
-                .Where(r => r.IsSuccess && r.StartTimeMs >= startWorkerTimeMs)
-                .OrderBy(r => r.StartTimeMs)
-                .Cast<RequestResult?>()
+                .Where(r => r.IsSuccess && r.StartTimestamp >= restoreTime)
+                .OrderBy(r => r.StartTimestamp)
                 .FirstOrDefault();
 
-            if (firstSuccess.HasValue)
+            if (firstSuccess != null)
             {
-                recoveryTimeMs = (firstSuccess.Value.StartTimeMs + firstSuccess.Value.LatencyMs) - startWorkerTimeMs;
+                httpRecoveryMs = (firstSuccess.EndTimestamp - restoreTime).TotalMilliseconds;
             }
 
-            await WaitForQueueToDrainAsync(asincMetrics.Success);
-            esvaziamentoSw.Stop();
+            var (drainCompleted, backlogDrainMs, pendingOps, dbMetrics) = await ExecuteDrainPhaseAsync(
+                asincMetrics.HTTPAccepted, restoreTime, 600);
+            var (finalReady, finalUnacked, finalTotal) = await RabbitMqManager.GetQueueStatusAsync();
 
-            runsAsinc.Add(new ScenarioResult
+            expSw.Stop();
+            queueCts.Cancel();
+
+            int maxDepth = queueSamples.Count > 0 ? queueSamples.Max(s => s.MessagesTotal) : totalAtEnd;
+            int maxReady = queueSamples.Count > 0 ? queueSamples.Max(s => s.MessagesReady) : readyAtEnd;
+            int maxUnacked = queueSamples.Count > 0 ? queueSamples.Max(s => s.MessagesUnacknowledged) : unackedAtEnd;
+
+            runsAsinc.Add(new SingleRunResult
             {
                 Scenario = "Cenário E: Falha de Mensageria",
                 Flow = "Assíncrono",
+                RunNumber = run,
                 Sent = asincMetrics.Sent,
-                Success = asincMetrics.Success,
-                Failure = asincMetrics.Failure,
-                Persisted = DatabaseHelper.GetEstornosCount(),
-                AverageLatencyMs = asincMetrics.AverageLatencyMs,
-                P95LatencyMs = asincMetrics.P95LatencyMs,
-                Throughput = asincMetrics.Throughput,
-                RecoveryTimeMs = recoveryTimeMs,
-                MaxQueueDepth = 0
+                HTTPAccepted = asincMetrics.HTTPAccepted,
+                HTTPFailed = asincMetrics.HTTPFailed,
+
+                // Snapshot no término exato do envio (AtSendEnd)
+                HTTPAcceptedAtSendEnd = accAtEnd,
+                UniquePersistedAtSendEnd = persAtEnd,
+                QueueReadyAtSendEnd = readyAtEnd,
+                QueueUnackedAtSendEnd = unackedAtEnd,
+                QueueTotalAtSendEnd = totalAtEnd,
+
+                // Estado final pós-drenagem (Final)
+                PersistedRowsFinal = dbMetrics.TotalPersisted,
+                UniquePersistedFinal = dbMetrics.UniquePersisted,
+                DuplicateRowsFinal = dbMetrics.DuplicateRows,
+                QueueTotalFinal = finalTotal,
+
+                HttpLatencyMeanAll = asincMetrics.HttpLatencyMeanAll,
+                HttpP95All = asincMetrics.HttpP95All,
+                HttpP99All = asincMetrics.HttpP99All,
+                HttpMaxAll = asincMetrics.HttpMaxAll,
+                HttpLatencyMeanSuccess = asincMetrics.HttpLatencyMeanSuccess,
+                HttpP95Success = asincMetrics.HttpP95Success,
+                HttpP99Success = asincMetrics.HttpP99Success,
+                ConfiguredSendRate = 5,
+                ActualSendRate = asincMetrics.ActualSendRate,
+                MaxQueueDepth = maxDepth,
+                MaxMessagesReady = maxReady,
+                MaxMessagesUnacked = maxUnacked,
+                HttpRecoveryTimeMs = httpRecoveryMs,
+                PersistenceRecoveryTimeMs = httpRecoveryMs,
+                BacklogDrainTimeMs = backlogDrainMs,
+                SendDurationMs = asincMetrics.SendDurationMs,
+                TotalExperimentDurationMs = expSw.Elapsed.TotalMilliseconds,
+                DrainCompleted = drainCompleted,
+                PendingOperations = pendingOps,
+                RawRequestResults = asincMetrics.RequestResults,
+                QueueSamples = queueSamples
             });
         }
-        results.Add(ReportGenerator.ConsolidateResults("Cenário E: Falha de Mensageria", "Assíncrono", runsAsinc));
+        var consolidatedAsinc = ReportGenerator.ConsolidateScenario("Cenário E: Falha de Mensageria", "Assíncrono", runsAsinc);
+
+        return new List<ConsolidatedScenarioResult> { consolidatedSinc, consolidatedAsinc };
     }
 
-    private static async Task WaitForQueueToDrainAsync(int targetCount)
+    private static async Task<(bool drainCompleted, double backlogDrainMs, int pendingOperations, DbMetrics dbMetrics)> ExecuteDrainPhaseAsync(
+        int targetAcceptedCount, DateTime referenceStartTimestamp, int maxTimeoutSeconds = 600)
     {
-        var sw = Stopwatch.StartNew();
-        int lastCount = -1;
-        int unchangedIterations = 0;
+        var drainSw = Stopwatch.StartNew();
+        bool drainCompleted = false;
+        DbMetrics dbMetrics = new();
+        int consecutiveZeroReadings = 0;
 
-        while (sw.Elapsed.TotalSeconds < 120)
+        while (drainSw.Elapsed.TotalSeconds < maxTimeoutSeconds)
         {
-            try
-            {
-                int currentCount = DatabaseHelper.GetEstornosCount();
-                if (currentCount >= targetCount) break;
+            dbMetrics = DatabaseHelper.GetDbMetrics();
+            var (ready, unacked, total) = await RabbitMqManager.GetQueueStatusAsync();
 
-                if (currentCount == lastCount && currentCount > 0)
+            if (dbMetrics.UniquePersisted >= targetAcceptedCount && total == 0)
+            {
+                consecutiveZeroReadings++;
+                if (consecutiveZeroReadings >= 2)
                 {
-                    unchangedIterations++;
-                    if (unchangedIterations >= 10) break; // Fila estabilizou após 5s sem novas inserções
-                }
-                else
-                {
-                    unchangedIterations = 0;
-                    lastCount = currentCount;
+                    drainCompleted = true;
+                    break;
                 }
             }
-            catch
+            else
             {
-                // Ignora exceções temporárias de reconexão
+                consecutiveZeroReadings = 0;
             }
 
-            await Task.Delay(500);
+            await Task.Delay(1000);
+        }
+
+        drainSw.Stop();
+        dbMetrics = DatabaseHelper.GetDbMetrics();
+
+        double backlogDrainMs = (DateTime.UtcNow - referenceStartTimestamp).TotalMilliseconds;
+        int pendingOps = Math.Max(0, targetAcceptedCount - dbMetrics.UniquePersisted);
+
+        return (drainCompleted, backlogDrainMs, pendingOps, dbMetrics);
+    }
+
+    public static async Task<List<CalibrationResult>> RunRateCalibrationAsync(string workspacePath)
+    {
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine("\n========================================================================");
+        Console.WriteLine("    CALIBRAÇÃO DE TAXA-BASE (3, 5 E 7 REQ/S POR 120 SEGUNDOS)");
+        Console.WriteLine("========================================================================");
+        Console.ResetColor();
+
+        int[] rates = new int[] { 3, 5, 7 };
+        var calibrationResults = new List<CalibrationResult>();
+
+        foreach (int rate in rates)
+        {
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine($"\n------------------------------------------------------------------------");
+            Console.WriteLine($" [TESTE DE CALIBRAÇÃO] Taxa: {rate} req/s | Duração: 120s | Fluxo Assíncrono");
+            Console.WriteLine($"------------------------------------------------------------------------");
+            Console.ResetColor();
+
+            await DockerManager.PrepareCleanEnvironmentAsync(workspacePath);
+            await DockerManager.RunWarmUpAsync(workspacePath);
+            await DockerManager.PrepareCleanEnvironmentAsync(workspacePath);
+
+            var checkDb = DatabaseHelper.GetDbMetrics();
+            var (checkReady, checkUnacked, checkTotal) = await RabbitMqManager.GetQueueStatusAsync();
+
+            Console.WriteLine($"[CONFIRMAÇÃO PRÉ-TESTE] Banco = {checkDb.TotalPersisted} | Fila RabbitMQ = {checkTotal}");
+            if (checkDb.TotalPersisted != 0 || checkTotal != 0)
+            {
+                throw new Exception($"Ambiente não está limpo pré-teste {rate} req/s! Banco: {checkDb.TotalPersisted}, Fila: {checkTotal}");
+            }
+
+            using var loadCts = new CancellationTokenSource();
+            var timeSeries = new List<CalibrationMetricSample>();
+
+            var expSw = Stopwatch.StartNew();
+
+            var loadTask = BenchmarkEngine.SendConstantRateLoadAsync(
+                AsincUrl, rate, TimeSpan.FromSeconds(120), "Calibração Taxa-Base", "Assíncrono", rate, loadCts.Token);
+
+            var monitorTask = Task.Run(async () =>
+            {
+                while (!loadCts.Token.IsCancellationRequested)
+                {
+                    var (ready, unacked, total) = await RabbitMqManager.GetQueueStatusAsync();
+                    int persisted = DatabaseHelper.GetEstornosCount();
+                    var (sentNow, accNow) = BenchmarkEngine.CurrentProgress;
+
+                    timeSeries.Add(new CalibrationMetricSample
+                    {
+                        Timestamp = DateTime.UtcNow,
+                        Sent = sentNow,
+                        HTTPAccepted = accNow,
+                        UniquePersisted = persisted,
+                        MessagesReady = ready,
+                        MessagesUnacknowledged = unacked,
+                        MessagesTotal = total
+                    });
+
+                    Console.WriteLine($"  [t={timeSeries.Count}s] Sent={sentNow} | Accepted={accNow} | Persisted={persisted} | Ready={ready} | Unacked={unacked} | TotalQueue={total}");
+
+                    try
+                    {
+                        await Task.Delay(1000, loadCts.Token);
+                    }
+                    catch (TaskCanceledException) { break; }
+                }
+            });
+
+            var loadMetrics = await loadTask;
+            DateTime sendEndTimestamp = DateTime.UtcNow;
+
+            loadCts.Cancel();
+            try { await monitorTask; } catch { }
+
+            var (finalReadyEnd, finalUnackedEnd, finalTotalEnd) = await RabbitMqManager.GetQueueStatusAsync();
+            int persistedAtSendEnd = DatabaseHelper.GetEstornosCount();
+
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine($"\n[TÉRMINO DO ENVIO - 120s ({rate} req/s)]");
+            Console.WriteLine($"  Sent: {loadMetrics.Sent} | HTTPAccepted: {loadMetrics.HTTPAccepted}");
+            Console.WriteLine($"  Persistidas ao fim do envio: {persistedAtSendEnd}");
+            Console.WriteLine($"  Profundidade da Fila ao fim do envio: {finalTotalEnd} (Ready: {finalReadyEnd}, Unacked: {finalUnackedEnd})");
+            Console.ResetColor();
+
+            var (drainCompleted, backlogDrainMs, pendingOps, dbMetrics) = await ExecuteDrainPhaseAsync(
+                loadMetrics.HTTPAccepted, sendEndTimestamp, 300);
+
+            expSw.Stop();
+
+            int maxQueueDepth = timeSeries.Count > 0 ? timeSeries.Max(s => s.MessagesTotal) : finalTotalEnd;
+            if (finalTotalEnd > maxQueueDepth) maxQueueDepth = finalTotalEnd;
+
+            double avgGrowthPerSec = 0;
+            if (timeSeries.Count > 1)
+            {
+                avgGrowthPerSec = (double)(finalTotalEnd - timeSeries.First().MessagesTotal) / timeSeries.Count;
+            }
+
+            string classification;
+            if (finalTotalEnd <= 5 && maxQueueDepth <= 15 && avgGrowthPerSec < 0.05)
+            {
+                classification = "ESTÁVEL";
+            }
+            else if (finalTotalEnd <= 30 && avgGrowthPerSec < 0.2)
+            {
+                classification = "LIMÍTROFE";
+            }
+            else
+            {
+                classification = "INSUSTENTÁVEL";
+            }
+
+            double? actualDrainTime = finalTotalEnd == 0 ? 0 : backlogDrainMs;
+
+            var calResult = new CalibrationResult
+            {
+                Rate = rate,
+                Sent = loadMetrics.Sent,
+                HTTPAccepted = loadMetrics.HTTPAccepted,
+                UniquePersistedAtSendEnd = persistedAtSendEnd,
+                FinalUniquePersisted = dbMetrics.UniquePersisted,
+                DuplicateRows = dbMetrics.DuplicateRows,
+                MaxQueueDepth = maxQueueDepth,
+                FinalQueueDepthAtSendEnd = finalTotalEnd,
+                BacklogDrainTimeMs = actualDrainTime,
+                ActualSendRate = loadMetrics.ActualSendRate,
+                Classification = classification,
+                AvgBacklogGrowthPerSec = avgGrowthPerSec,
+                TimeSeries = timeSeries
+            };
+
+            calibrationResults.Add(calResult);
+            SaveCalibrationCsv(workspacePath, calResult);
+        }
+
+        PrintCalibrationSummaryTable(calibrationResults);
+        return calibrationResults;
+    }
+
+    private static void SaveCalibrationCsv(string workspacePath, CalibrationResult result)
+    {
+        try
+        {
+            string calDir = Path.Combine(workspacePath, "results", "calibration");
+            Directory.CreateDirectory(calDir);
+
+            string file = Path.Combine(calDir, $"calibração-{result.Rate}reqs.csv");
+            using var writer = new StreamWriter(file, false, System.Text.Encoding.UTF8);
+            writer.WriteLine("Timestamp,Sent,HTTPAccepted,UniquePersisted,MessagesReady,MessagesUnacknowledged,MessagesTotal");
+            foreach (var s in result.TimeSeries)
+            {
+                writer.WriteLine($"{s.Timestamp:yyyy-MM-dd HH:mm:ss.fff},{s.Sent},{s.HTTPAccepted},{s.UniquePersisted},{s.MessagesReady},{s.MessagesUnacknowledged},{s.MessagesTotal}");
+            }
+            Console.WriteLine($"[SÉRIE TEMPORAL SALVA] {file}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[ERRO SALVAR CALIBRAÇÃO CSV] {ex.Message}");
         }
     }
-}
 
+    private static void PrintCalibrationSummaryTable(List<CalibrationResult> results)
+    {
+        Console.ForegroundColor = ConsoleColor.Green;
+        Console.WriteLine("\n========================================================================");
+        Console.WriteLine("          RESULTADO DA CALIBRAÇÃO DA TAXA-BASE ");
+        Console.WriteLine("========================================================================");
+        Console.ResetColor();
+
+        Console.WriteLine("| Taxa | Enviadas | Persistidas ao fim do envio | Max fila | Fila ao fim do envio | Drenagem | Classificação | Crescimento Fila/s |");
+        Console.WriteLine("|------|----------|------------------------------|----------|----------------------|----------|---------------|-------------------|");
+
+        foreach (var r in results)
+        {
+            string drainStr = r.BacklogDrainTimeMs.HasValue && r.FinalQueueDepthAtSendEnd > 0 ? $"{r.BacklogDrainTimeMs.Value:F1} ms" : "0 ms (Zerada)";
+            Console.WriteLine($"| {r.Rate} req/s | {r.Sent} | {r.UniquePersistedAtSendEnd} | {r.MaxQueueDepth} | {r.FinalQueueDepthAtSendEnd} | {drainStr} | {r.Classification} | +{r.AvgBacklogGrowthPerSec:F2} msgs/s |");
+        }
+        Console.WriteLine("========================================================================\n");
+    }
+}
